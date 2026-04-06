@@ -1,7 +1,7 @@
 Package: llamaR
 Type: Package
 Title: Interface for Large Language Models via 'llama.cpp'
-Version: 0.2.2
+Version: 0.2.3
 Authors@R: c(
     person("Yuri", "Baramykov", email = "lbsbmsu@mail.ru", role = c("aut", "cre")),
     person("Georgi", "Gerganov", role = "cph",
@@ -26,10 +26,10 @@ Suggests: testthat (>= 3.0.0), withr
 RoxygenNote: 7.3.3
 Config/testthat/edition: 3
 NeedsCompilation: yes
-Packaged: 2026-03-01 07:30:11 UTC; yuri
+Packaged: 2026-04-05 18:51:04 UTC; yuri
 Author: Yuri Baramykov [aut, cre],
   Georgi Gerganov [cph] (Author of the 'llama.cpp' library included in
     src/)
 Maintainer: Yuri Baramykov <lbsbmsu@mail.ru>
 Repository: CRAN
-Date/Publication: 2026-03-05 19:20:02 UTC
+Date/Publication: 2026-04-06 10:10:02 UTC
