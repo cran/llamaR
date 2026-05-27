@@ -121,11 +121,20 @@ llama_backend_devices <- function() {
 #' Load a GGUF model file
 #'
 #' @param path Path to the .gguf model file
-#' @param n_gpu_layers Number of layers to offload to GPU (0 = CPU only, -1 = all)
+#' @param n_gpu_layers Number of layers to offload to GPU
+#'   (\code{-1L} = all, \code{0L} = CPU only). Default \code{-1L} offloads
+#'   everything to the GPU when one is detected; if no GPU backend is
+#'   available, falls back to CPU with a warning.
 #' @param devices Character vector of device names or types to use for offloading.
 #'   \code{NULL} (default) uses all available devices. Use \code{"cpu"} for CPU-only,
 #'   \code{"gpu"} for first GPU, or specific device names from
 #'   \code{\link{llama_backend_devices}}. Multiple devices enable multi-GPU split.
+#' @param split_mode Multi-GPU split strategy: \code{"none"} (single GPU),
+#'   \code{"layer"} (split layers across GPUs, default), or \code{"row"}
+#'   (tensor-parallel across GPUs).
+#' @param use_mmap Logical; map model file into memory (default \code{TRUE}).
+#' @param use_mlock Logical; force the OS to keep model pages resident
+#'   (default \code{FALSE}).
 #' @return An external pointer (class \code{externalptr}) wrapping the loaded
 #'   model. This handle is required by \code{\link{llama_new_context}},
 #'   \code{\link{llama_model_info}}, and other model-level functions.
@@ -134,11 +143,11 @@ llama_backend_devices <- function() {
 #' @export
 #' @examples
 #' \dontrun{
-#' # Load model on CPU only
+#' # Default: full GPU offload (falls back to CPU if no GPU)
 #' model <- llama_load_model("model.gguf")
 #'
-#' # Load model with all layers on GPU
-#' model <- llama_load_model("model.gguf", n_gpu_layers = -1L)
+#' # Force CPU-only
+#' model <- llama_load_model("model.gguf", n_gpu_layers = 0L)
 #'
 #' # Explicit CPU-only backend
 #' model <- llama_load_model("model.gguf", devices = "cpu")
@@ -150,11 +159,27 @@ llama_backend_devices <- function() {
 #' model <- llama_load_model("model.gguf", n_gpu_layers = -1L,
 #'                           devices = c("Vulkan0", "Vulkan1"))
 #' }
-llama_load_model <- function(path, n_gpu_layers = 0L, devices = NULL) {
+llama_load_model <- function(path, n_gpu_layers = -1L, devices = NULL,
+                             split_mode = "layer",
+                             use_mmap = TRUE, use_mlock = FALSE) {
     stopifnot(is.character(path), length(path) == 1)
     if (!file.exists(path)) stop("llamaR: model file does not exist: ", path)
     if (!is.null(devices)) stopifnot(is.character(devices))
-    .Call("r_llama_load_model", path, as.integer(n_gpu_layers), devices)
+
+    n_gpu_layers <- as.integer(n_gpu_layers)
+    if (n_gpu_layers != 0L && !llama_supports_gpu()) {
+        warning("llamaR: no GPU backend detected, falling back to CPU")
+        n_gpu_layers <- 0L
+    }
+
+    split_mode_int <- switch(split_mode,
+        "none"  = 0L,
+        "layer" = 1L,
+        "row"   = 2L,
+        stop("split_mode must be 'none', 'layer', or 'row'"))
+
+    .Call("r_llama_load_model", path, n_gpu_layers, devices,
+          split_mode_int, as.logical(use_mmap), as.logical(use_mlock))
 }
 
 #' Free a loaded model
@@ -214,7 +239,21 @@ llama_model_info <- function(model) {
 #'
 #' @param model Model handle returned by [llama_load_model]
 #' @param n_ctx Context window size (number of tokens). 0 means use the model's trained value.
-#' @param n_threads Number of CPU threads to use
+#' @param n_threads Number of CPU threads for single-token decode. \code{NULL}
+#'   (default) picks \code{2L} when a GPU backend is available, otherwise \code{4L}.
+#' @param n_threads_batch Number of CPU threads for batch (prompt) processing.
+#'   \code{NULL} (default) inherits from \code{n_threads}.
+#' @param n_batch Logical maximum batch size submitted to a single decode call
+#'   (tokens). Default \code{2048L} matches llama.cpp.
+#' @param n_ubatch Physical micro-batch size used inside decode. Larger values
+#'   improve prefill throughput on GPU at the cost of memory. Default \code{512L}.
+#' @param n_seq_max Maximum number of parallel sequences the context can hold
+#'   simultaneously (KV cache is partitioned across them). Default \code{1L}
+#'   for single-prompt use; raise to \code{N} when using
+#'   \code{\link{llama_generate_batch}} with \code{N} prompts. Increasing this
+#'   does not by itself enlarge the context — also size \code{n_ctx} accordingly.
+#' @param flash_attn One of \code{"auto"} (let llama.cpp decide, default),
+#'   \code{"on"} (force enable Flash Attention), or \code{"off"} (disable).
 #' @param embedding Logical; if \code{TRUE}, create context in embedding mode.
 #'   This enables embedding output and disables causal attention, suitable for
 #'   embedding models (e.g. nomic-embed, bge). When \code{TRUE},
@@ -232,12 +271,39 @@ llama_model_info <- function(model) {
 #' llama_free_context(ctx)
 #' llama_free_model(model)
 #'
+#' # Tune for GPU prefill throughput
+#' ctx <- llama_new_context(model, n_ctx = 4096L,
+#'                          n_ubatch = 2048L, flash_attn = "on")
+#'
 #' # Embedding mode
 #' emb_ctx <- llama_new_context(model, n_ctx = 512L, embedding = TRUE)
 #' mat <- llama_embed_batch(emb_ctx, c("hello", "world"))
 #' }
-llama_new_context <- function(model, n_ctx = 2048L, n_threads = 4L, embedding = FALSE) {
-    .Call("r_llama_new_context", model, as.integer(n_ctx), as.integer(n_threads),
+llama_new_context <- function(model, n_ctx = 2048L,
+                              n_threads = NULL, n_threads_batch = NULL,
+                              n_batch = 2048L, n_ubatch = 512L,
+                              n_seq_max = 1L,
+                              flash_attn = "auto",
+                              embedding = FALSE) {
+    if (is.null(n_threads)) {
+        n_threads <- if (llama_supports_gpu()) 2L else 4L
+    }
+    if (is.null(n_threads_batch)) {
+        n_threads_batch <- n_threads
+    }
+
+    flash_attn_int <- switch(flash_attn,
+        "auto" = -1L,
+        "on"   =  1L,
+        "off"  =  0L,
+        stop("flash_attn must be 'auto', 'on', or 'off'"))
+
+    .Call("r_llama_new_context", model,
+          as.integer(n_ctx),
+          as.integer(n_threads), as.integer(n_threads_batch),
+          as.integer(n_batch), as.integer(n_ubatch),
+          as.integer(n_seq_max),
+          flash_attn_int,
           as.logical(embedding))
 }
 
@@ -264,6 +330,11 @@ llama_free_context <- function(ctx) {
 #' @param ctx Context handle returned by [llama_new_context]
 #' @param text Character string to tokenize
 #' @param add_special Whether to add special tokens (BOS/EOS) as configured by the model
+#' @param parse_special Whether to parse control/special tokens (e.g. Mistral's
+#'   \code{[INST]}, ChatML's \code{<|im_start|>}) as single tokens rather than
+#'   as their literal characters. Use \code{TRUE} for a prompt produced by
+#'   [llama_chat_apply_template]; the default \code{FALSE} treats such markup as
+#'   plain text.
 #' @return An integer vector of token IDs as used by the model's vocabulary.
 #' @export
 #' @examples
@@ -277,10 +348,15 @@ llama_free_context <- function(ctx) {
 #'
 #' # Without special tokens
 #' tokens <- llama_tokenize(ctx, "Hello", add_special = FALSE)
+#'
+#' # Parse a templated prompt's role markers as control tokens
+#' prompt <- llama_chat_apply_template(list(list(role = "user", content = "hi")))
+#' tokens <- llama_tokenize(ctx, prompt, parse_special = TRUE)
 #' }
-llama_tokenize <- function(ctx, text, add_special = TRUE) {
+llama_tokenize <- function(ctx, text, add_special = TRUE, parse_special = FALSE) {
     stopifnot(is.character(text), length(text) == 1)
-    .Call("r_llama_tokenize", ctx, text, as.logical(add_special))
+    .Call("r_llama_tokenize", ctx, text,
+          as.logical(add_special), as.logical(parse_special))
 }
 
 #' Detokenize token IDs back to text
@@ -327,6 +403,13 @@ llama_detokenize <- function(ctx, tokens) {
 #' @param mirostat_tau Mirostat target entropy (tau parameter)
 #' @param mirostat_eta Mirostat learning rate (eta parameter)
 #' @param grammar GBNF grammar string for constrained generation (NULL = disabled)
+#' @param with_timings If TRUE, attach a named numeric vector of per-stage
+#'   timings (in ms) as attribute "timings" of the returned text. Stages:
+#'   tokenize, build_sampler, kv_clear, prefill_dispatch, prefill_sync,
+#'   gpu_sync (cumulative across decode-loop iterations), sample (cumulative),
+#'   decode_dispatch (cumulative), detokenize, plus n_iterations and t_total_ms.
+#'   Adds llama_synchronize calls inside the loop, so it is intended for
+#'   profiling and may slightly slow generation.
 #' @return A character scalar containing the generated text (excluding the
 #'   original prompt).
 #' @export
@@ -361,7 +444,7 @@ llama_generate <- function(ctx, prompt, max_new_tokens = 256L,
                            repeat_penalty = 1.0, repeat_last_n = 64L,
                            frequency_penalty = 0.0, presence_penalty = 0.0,
                            mirostat = 0L, mirostat_tau = 5.0, mirostat_eta = 0.1,
-                           grammar = NULL) {
+                           grammar = NULL, with_timings = FALSE) {
     stopifnot(is.character(prompt), length(prompt) == 1)
     .Call("r_llama_generate", ctx, prompt,
           as.integer(max_new_tokens), as.double(temp),
@@ -370,6 +453,159 @@ llama_generate <- function(ctx, prompt, max_new_tokens = 256L,
           as.double(repeat_penalty), as.integer(repeat_last_n),
           as.double(frequency_penalty), as.double(presence_penalty),
           as.integer(mirostat), as.double(mirostat_tau), as.double(mirostat_eta),
+          grammar, as.logical(with_timings))
+}
+
+#' Begin a streaming (token-by-token) generation
+#'
+#' Sets up sampling and prefills the prompt, returning an opaque state handle
+#' that is pulled one chunk at a time with [llama_gen_next]. This is the
+#' streaming counterpart to [llama_generate]: same sampler chain and the same
+#' output for a given seed, but text arrives incrementally so it can be pushed
+#' into an SSE stream as it is produced.
+#'
+#' Typical loop:
+#' \preformatted{
+#' st <- llama_gen_begin(ctx, prompt)
+#' repeat {
+#'   chunk <- llama_gen_next(st)
+#'   if (is.null(chunk)) break
+#'   cat(chunk)
+#' }
+#' cat(llama_gen_end(st))  # flush any held-back trailing bytes
+#' }
+#'
+#' Only one streaming generation may be active per context at a time: each
+#' call to \code{llama_gen_begin} clears the context KV cache.
+#'
+#' @inheritParams llama_generate
+#' @return An external pointer holding the generation state. Pass it to
+#'   [llama_gen_next] and [llama_gen_end]. The underlying sampler is freed
+#'   automatically by the garbage collector.
+#' @seealso [llama_gen_next], [llama_gen_end], [llama_generate]
+#' @export
+llama_gen_begin <- function(ctx, prompt, max_new_tokens = 256L,
+                            temp = 0.8, top_k = 50L, top_p = 0.9, seed = 42L,
+                            min_p = 0.0, typical_p = 1.0,
+                            repeat_penalty = 1.0, repeat_last_n = 64L,
+                            frequency_penalty = 0.0, presence_penalty = 0.0,
+                            mirostat = 0L, mirostat_tau = 5.0, mirostat_eta = 0.1,
+                            grammar = NULL) {
+    stopifnot(is.character(prompt), length(prompt) == 1)
+    .Call("r_llama_gen_begin", ctx, prompt,
+          as.integer(max_new_tokens), as.double(temp),
+          as.integer(top_k), as.double(top_p), as.integer(seed),
+          as.double(min_p), as.double(typical_p),
+          as.double(repeat_penalty), as.integer(repeat_last_n),
+          as.double(frequency_penalty), as.double(presence_penalty),
+          as.integer(mirostat), as.double(mirostat_tau), as.double(mirostat_eta),
+          grammar)
+}
+
+#' Pull the next chunk of a streaming generation
+#'
+#' Advances a generation started with [llama_gen_begin] by one token and
+#' returns the next chunk of decoded text. A possibly-incomplete trailing
+#' UTF-8 character is held back until enough bytes arrive, so every returned
+#' chunk is valid UTF-8 (the chunk may be \code{""} when the only new byte is
+#' part of an unfinished character).
+#'
+#' @param state Generation state handle from [llama_gen_begin].
+#' @return A length-1 UTF-8 character vector with the next chunk, or
+#'   \code{NULL} when generation has finished (end-of-generation token reached
+#'   or \code{max_new_tokens} exhausted). After \code{NULL}, call
+#'   [llama_gen_end] to flush any remaining bytes.
+#' @seealso [llama_gen_begin], [llama_gen_end]
+#' @export
+llama_gen_next <- function(state) {
+    .Call("r_llama_gen_next", state)
+}
+
+#' Finish a streaming generation
+#'
+#' Marks the generation done and returns any bytes still held in the internal
+#' UTF-8 carry buffer (the tail of an unfinished character, if generation
+#' stopped mid-character). Concatenating every [llama_gen_next] chunk followed
+#' by the \code{llama_gen_end} result reproduces the full [llama_generate]
+#' output for the same seed and parameters. Safe to call more than once.
+#'
+#' @param state Generation state handle from [llama_gen_begin].
+#' @return A length-1 UTF-8 character vector with any remaining buffered text
+#'   (often \code{""}).
+#' @seealso [llama_gen_begin], [llama_gen_next]
+#' @export
+llama_gen_end <- function(state) {
+    .Call("r_llama_gen_end", state)
+}
+
+#' Generate completions for multiple prompts in parallel
+#'
+#' Runs continuous batching: all prompts share the same decode loop, so each
+#' iteration dispatches one matmul over all still-running sequences. This
+#' converts decode from memory-bound vector ops into compute-bound matrix ops
+#' on the GPU and lifts throughput compared to calling \code{\link{llama_generate}}
+#' in a loop.
+#'
+#' The context must be created with \code{n_seq_max >= length(prompts)} and
+#' \code{n_ctx} large enough to hold every prompt plus its generated tokens
+#' simultaneously. As a rule of thumb:
+#' \code{n_ctx >= sum(prompt_lengths) + length(prompts) * max_new_tokens}.
+#'
+#' Each sequence gets its own sampler chain seeded with \code{seed + seq_index},
+#' so identical prompts still produce diverse outputs at \code{temp > 0}
+#' (useful for self-consistency sampling). Sampler hyperparameters are shared
+#' across sequences in this version.
+#'
+#' Stop conditions per sequence: end-of-generation token (model-defined) or
+#' \code{max_new_tokens} reached. Mirostat and \code{with_timings} are not
+#' supported here yet — use \code{\link{llama_generate}} for those.
+#'
+#' @param ctx Context handle returned by [llama_new_context], created with
+#'   sufficient \code{n_seq_max} and \code{n_ctx} (see Details).
+#' @param prompts Character vector of prompts, one per parallel sequence.
+#' @param max_new_tokens,temp,top_k,top_p,seed,min_p,typical_p,repeat_penalty,repeat_last_n,frequency_penalty,presence_penalty,grammar
+#'   Sampling parameters; see \code{\link{llama_generate}}. Shared across
+#'   sequences. \code{seed} is offset per sequence (\code{seed + s}).
+#' @return A list of length \code{length(prompts)}, in the same order as the
+#'   input. Each element is a list with fields:
+#'   \itemize{
+#'     \item \code{text}: character scalar with the generated text
+#'     \item \code{n_tokens}: integer count of tokens generated
+#'     \item \code{finished_reason}: \code{"eos"} or \code{"max_tokens"}
+#'   }
+#' @export
+#' @examples
+#' \dontrun{
+#' model <- llama_load_model("model.gguf", n_gpu_layers = -1L)
+#' # 4 parallel sequences, up to 256 new tokens each
+#' ctx <- llama_new_context(model, n_ctx = 4096L, n_seq_max = 4L,
+#'                          flash_attn = "on")
+#'
+#' # Batch classification
+#' prompts <- c("Classify: 'great movie' as positive/negative.",
+#'              "Classify: 'awful service' as positive/negative.",
+#'              "Classify: 'just okay' as positive/negative.",
+#'              "Classify: 'loved every minute' as positive/negative.")
+#' out <- llama_generate_batch(ctx, prompts, max_new_tokens = 16L, temp = 0)
+#' vapply(out, `[[`, character(1), "text")
+#'
+#' # Self-consistency sampling: same prompt repeated
+#' samples <- llama_generate_batch(ctx, rep("2 + 2 =", 4L),
+#'                                 max_new_tokens = 8L, temp = 0.7)
+#' }
+llama_generate_batch <- function(ctx, prompts, max_new_tokens = 256L,
+                                 temp = 0.8, top_k = 50L, top_p = 0.9, seed = 42L,
+                                 min_p = 0.0, typical_p = 1.0,
+                                 repeat_penalty = 1.0, repeat_last_n = 64L,
+                                 frequency_penalty = 0.0, presence_penalty = 0.0,
+                                 grammar = NULL) {
+    stopifnot(is.character(prompts), length(prompts) >= 1)
+    .Call("r_llama_generate_batch", ctx, prompts,
+          as.integer(max_new_tokens), as.double(temp),
+          as.integer(top_k), as.double(top_p), as.integer(seed),
+          as.double(min_p), as.double(typical_p),
+          as.double(repeat_penalty), as.integer(repeat_last_n),
+          as.double(frequency_penalty), as.double(presence_penalty),
           grammar)
 }
 

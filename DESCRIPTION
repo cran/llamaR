@@ -1,9 +1,10 @@
 Package: llamaR
 Type: Package
 Title: Interface for Large Language Models via 'llama.cpp'
-Version: 0.2.3
+Version: 0.2.4
 Authors@R: c(
-    person("Yuri", "Baramykov", email = "lbsbmsu@mail.ru", role = c("aut", "cre")),
+    person("Yuri", "Baramykov", email = "lbsbmsu@mail.ru", role = c("aut", "cre"),
+           comment = c(ORCID = "0009-0000-7627-4217")),
     person("Georgi", "Gerganov", role = "cph",
            comment = "Author of the 'llama.cpp' library included in src/"))
 Description: Provides 'R' bindings to 'llama.cpp' for running Large Language Models
@@ -22,14 +23,17 @@ Depends: R (>= 4.1.0), ggmlR
 LinkingTo: ggmlR
 SystemRequirements: C++17, GNU make
 Imports: jsonlite, utils
-Suggests: testthat (>= 3.0.0), withr
+Suggests: testthat (>= 3.0.0), withr, drogonR, later, ellmer, callr,
+        knitr, rmarkdown
+VignetteBuilder: knitr
 RoxygenNote: 7.3.3
 Config/testthat/edition: 3
 NeedsCompilation: yes
-Packaged: 2026-04-05 18:51:04 UTC; yuri
-Author: Yuri Baramykov [aut, cre],
+Packaged: 2026-05-27 16:43:45 UTC; yuri
+Author: Yuri Baramykov [aut, cre] (ORCID:
+    <https://orcid.org/0009-0000-7627-4217>),
   Georgi Gerganov [cph] (Author of the 'llama.cpp' library included in
     src/)
 Maintainer: Yuri Baramykov <lbsbmsu@mail.ru>
 Repository: CRAN
-Date/Publication: 2026-04-06 10:10:02 UTC
+Date/Publication: 2026-05-27 17:30:02 UTC

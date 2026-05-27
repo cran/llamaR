@@ -1,6 +1,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <chrono>
 
 #include <R.h>
 #include <Rinternals.h>
@@ -60,6 +61,25 @@ static void context_finalizer(SEXP x) {
     llama_context * ctx = (llama_context *) R_ExternalPtrAddr(x);
     if (ctx) {
         llama_free(ctx);
+        R_SetExternalPtrAddr(x, NULL);
+    }
+}
+
+// Streaming generation state (token-by-token), see r_llama_gen_* below.
+struct llama_gen_state {
+    llama_context *      ctx   = NULL;   // borrowed, not owned
+    const llama_vocab *  vocab = NULL;   // borrowed
+    llama_sampler *      smpl  = NULL;   // owned, freed by finalizer
+    int                  n_remaining = 0;
+    bool                 done  = false;
+    std::string          utf8_buf;       // bytes of an incomplete trailing UTF-8 char
+};
+
+static void gen_state_finalizer(SEXP x) {
+    llama_gen_state * st = (llama_gen_state *) R_ExternalPtrAddr(x);
+    if (st) {
+        if (st->smpl) llama_sampler_free(st->smpl);
+        delete st;
         R_SetExternalPtrAddr(x, NULL);
     }
 }
@@ -155,7 +175,8 @@ extern "C" SEXP r_llama_backend_devices(void) {
 // Model: load / free / info
 // ============================================================
 
-extern "C" SEXP r_llama_load_model(SEXP r_path, SEXP r_n_gpu_layers, SEXP r_devices) {
+extern "C" SEXP r_llama_load_model(SEXP r_path, SEXP r_n_gpu_layers, SEXP r_devices,
+                                   SEXP r_split_mode, SEXP r_use_mmap, SEXP r_use_mlock) {
     ensure_backend_init();
 
     const char * path = CHAR(STRING_ELT(r_path, 0));
@@ -163,6 +184,9 @@ extern "C" SEXP r_llama_load_model(SEXP r_path, SEXP r_n_gpu_layers, SEXP r_devi
 
     struct llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
+    mparams.split_mode   = (enum llama_split_mode) INTEGER(r_split_mode)[0];
+    mparams.use_mmap     = LOGICAL(r_use_mmap)[0];
+    mparams.use_mlock    = LOGICAL(r_use_mlock)[0];
 
     // device selection
     std::vector<ggml_backend_dev_t> devs;
@@ -252,8 +276,11 @@ extern "C" SEXP r_llama_model_info(SEXP r_model) {
 // Context: new / free
 // ============================================================
 
-extern "C" SEXP r_llama_new_context(SEXP r_model, SEXP r_n_ctx, SEXP r_n_threads,
-                                    SEXP r_embedding) {
+extern "C" SEXP r_llama_new_context(SEXP r_model, SEXP r_n_ctx,
+                                    SEXP r_n_threads, SEXP r_n_threads_batch,
+                                    SEXP r_n_batch, SEXP r_n_ubatch,
+                                    SEXP r_n_seq_max,
+                                    SEXP r_flash_attn, SEXP r_embedding) {
     llama_model * model = (llama_model *) R_ExternalPtrAddr(r_model);
     if (!model) Rf_error("llamaR: invalid model pointer");
 
@@ -262,8 +289,15 @@ extern "C" SEXP r_llama_new_context(SEXP r_model, SEXP r_n_ctx, SEXP r_n_threads
     struct llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx            = (uint32_t) INTEGER(r_n_ctx)[0];
     cparams.n_threads        = INTEGER(r_n_threads)[0];
-    cparams.n_threads_batch  = INTEGER(r_n_threads)[0];
+    cparams.n_threads_batch  = INTEGER(r_n_threads_batch)[0];
+    cparams.n_batch          = (uint32_t) INTEGER(r_n_batch)[0];
+    cparams.n_ubatch         = (uint32_t) INTEGER(r_n_ubatch)[0];
+    cparams.n_seq_max        = (uint32_t) INTEGER(r_n_seq_max)[0];
+    cparams.flash_attn_type  = (enum llama_flash_attn_type) INTEGER(r_flash_attn)[0];
     cparams.embeddings       = embedding;
+    cparams.kv_unified       = false; // match llama-bench / upstream default
+    cparams.swa_full         = false; // match llama-bench
+    cparams.no_perf          = false; // enable llama_perf_context() counters
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
@@ -304,23 +338,25 @@ extern "C" SEXP r_llama_free_context(SEXP r_ctx) {
 // Tokenize / Detokenize
 // ============================================================
 
-extern "C" SEXP r_llama_tokenize(SEXP r_ctx, SEXP r_text, SEXP r_add_special) {
+extern "C" SEXP r_llama_tokenize(SEXP r_ctx, SEXP r_text, SEXP r_add_special,
+                                 SEXP r_parse_special) {
     llama_context * ctx = (llama_context *) R_ExternalPtrAddr(r_ctx);
     if (!ctx) Rf_error("llamaR: invalid context pointer");
 
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    const char * text       = CHAR(STRING_ELT(r_text, 0));
-    bool         add_special = LOGICAL(r_add_special)[0] != 0;
-    int          text_len   = (int) strlen(text);
+    const char * text          = CHAR(STRING_ELT(r_text, 0));
+    bool         add_special   = LOGICAL(r_add_special)[0] != 0;
+    bool         parse_special = LOGICAL(r_parse_special)[0] != 0;
+    int          text_len      = (int) strlen(text);
 
     // first pass: get required buffer size (returns negative on "need more space")
-    int n_tokens = llama_tokenize(vocab, text, text_len, NULL, 0, add_special, false);
+    int n_tokens = llama_tokenize(vocab, text, text_len, NULL, 0, add_special, parse_special);
     if (n_tokens < 0) n_tokens = -n_tokens;
 
     std::vector<llama_token> tokens(n_tokens);
-    int actual = llama_tokenize(vocab, text, text_len, tokens.data(), n_tokens, add_special, false);
+    int actual = llama_tokenize(vocab, text, text_len, tokens.data(), n_tokens, add_special, parse_special);
     if (actual < 0) {
         Rf_error("llamaR: tokenization failed");
     }
@@ -369,7 +405,8 @@ extern "C" SEXP r_llama_generate(SEXP r_ctx, SEXP r_prompt,
                                   SEXP r_repeat_penalty, SEXP r_repeat_last_n,
                                   SEXP r_frequency_penalty, SEXP r_presence_penalty,
                                   SEXP r_mirostat, SEXP r_mirostat_tau,
-                                  SEXP r_mirostat_eta, SEXP r_grammar) {
+                                  SEXP r_mirostat_eta, SEXP r_grammar,
+                                  SEXP r_with_timings) {
     llama_context * ctx = (llama_context *) R_ExternalPtrAddr(r_ctx);
     if (!ctx) Rf_error("llamaR: invalid context pointer");
 
@@ -392,11 +429,28 @@ extern "C" SEXP r_llama_generate(SEXP r_ctx, SEXP r_prompt,
     float        mirostat_tau   = (float) REAL(r_mirostat_tau)[0];
     float        mirostat_eta   = (float) REAL(r_mirostat_eta)[0];
     const char * grammar        = Rf_isNull(r_grammar) ? NULL : CHAR(STRING_ELT(r_grammar, 0));
+    bool         with_timings   = (Rf_asLogical(r_with_timings) == TRUE);
 
     int prompt_len = (int) strlen(prompt);
 
+    using clk = std::chrono::steady_clock;
+    auto t_total_start = clk::now();
+    double t_tokenize_ms = 0, t_build_sampler_ms = 0, t_kv_clear_ms = 0;
+    double t_prefill_dispatch_ms = 0, t_prefill_sync_ms = 0;
+    double t_gpu_sync_ms = 0, t_sample_ms = 0, t_decode_dispatch_ms = 0;
+    double t_post_decode_sync_ms = 0;
+    double t_detokenize_ms = 0;
+    int    n_iterations = 0;
+    int    n_splits_prefill = 0;
+    int    n_splits_decode  = 0;
+
+    auto tic = clk::now();
+
     // --- tokenize prompt ---
-    int n_tokens = llama_tokenize(vocab, prompt, prompt_len, NULL, 0, true, false);
+    // parse_special = true: the prompt has already been through the chat
+    // template, so role markers like [INST]/<|im_start|> are control tokens
+    // and must be parsed as such, not split into literal characters.
+    int n_tokens = llama_tokenize(vocab, prompt, prompt_len, NULL, 0, true, true);
     if (n_tokens < 0) n_tokens = -n_tokens;
     if (n_tokens == 0) {
         Rf_error("llamaR: prompt produced zero tokens");
@@ -404,9 +458,14 @@ extern "C" SEXP r_llama_generate(SEXP r_ctx, SEXP r_prompt,
 
     std::vector<llama_token> prompt_tokens(n_tokens);
     int actual = llama_tokenize(vocab, prompt, prompt_len,
-                                prompt_tokens.data(), n_tokens, true, false);
+                                prompt_tokens.data(), n_tokens, true, true);
     if (actual < 0) Rf_error("llamaR: tokenization failed");
     n_tokens = actual;
+
+    if (with_timings) {
+        t_tokenize_ms = std::chrono::duration<double, std::milli>(clk::now() - tic).count();
+        tic = clk::now();
+    }
 
     // --- build sampler chain ---
     auto sparams = llama_sampler_chain_default_params();
@@ -449,13 +508,44 @@ extern "C" SEXP r_llama_generate(SEXP r_ctx, SEXP r_prompt,
         llama_sampler_chain_add(smpl, llama_sampler_init_mirostat_v2(seed, mirostat_tau, mirostat_eta));
     }
 
-    // --- clear KV cache and encode prompt ---
+    if (with_timings) {
+        t_build_sampler_ms = std::chrono::duration<double, std::milli>(clk::now() - tic).count();
+        tic = clk::now();
+    }
+
+    // --- clear KV cache ---
     llama_memory_clear(llama_get_memory(ctx), true);
 
-    struct llama_batch batch = llama_batch_get_one(prompt_tokens.data(), n_tokens);
-    if (llama_decode(ctx, batch) != 0) {
-        llama_sampler_free(smpl);
-        Rf_error("llamaR: failed to process prompt");
+    if (with_timings) {
+        t_kv_clear_ms = std::chrono::duration<double, std::milli>(clk::now() - tic).count();
+        tic = clk::now();
+    }
+
+    // --- prefill: dispatch (chunked by n_batch) ---
+    // A single llama_decode carries at most n_batch tokens; split long
+    // prompts so we never trip llama.cpp's n_tokens <= n_batch assert.
+    struct llama_batch batch;
+    {
+        int n_batch = (int) llama_n_batch(ctx);
+        if (n_batch <= 0) n_batch = n_tokens;
+        for (int off = 0; off < n_tokens; off += n_batch) {
+            int n_chunk = (n_tokens - off < n_batch) ? (n_tokens - off) : n_batch;
+            batch = llama_batch_get_one(prompt_tokens.data() + off, n_chunk);
+            if (llama_decode(ctx, batch) != 0) {
+                llama_sampler_free(smpl);
+                Rf_error("llamaR: failed to process prompt (chunk at offset %d of %d)",
+                         off, n_tokens);
+            }
+        }
+    }
+
+    if (with_timings) {
+        t_prefill_dispatch_ms = std::chrono::duration<double, std::milli>(clk::now() - tic).count();
+        tic = clk::now();
+        // honest GPU wait for prefill, isolated from first sample
+        llama_synchronize(ctx);
+        t_prefill_sync_ms = std::chrono::duration<double, std::milli>(clk::now() - tic).count();
+        n_splits_prefill = llama_n_splits(ctx);
     }
 
     // --- autoregressive decode loop ---
@@ -463,17 +553,52 @@ extern "C" SEXP r_llama_generate(SEXP r_ctx, SEXP r_prompt,
     llama_token current_token;
 
     for (int i = 0; i < max_new_tokens; i++) {
+        if (with_timings) {
+            // before sampling, ensure GPU is done with the previous decode dispatch
+            // (skipped on i=0 because prefill_sync already drained it)
+            if (i > 0) {
+                auto t0 = clk::now();
+                llama_synchronize(ctx);
+                t_gpu_sync_ms += std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            }
+        }
+
+        auto t_s0 = with_timings ? clk::now() : clk::time_point{};
         current_token = llama_sampler_sample(smpl, ctx, -1);
 
-        if (llama_vocab_is_eog(vocab, current_token)) break;
+        if (llama_vocab_is_eog(vocab, current_token)) {
+            if (with_timings) {
+                t_sample_ms += std::chrono::duration<double, std::milli>(clk::now() - t_s0).count();
+                n_iterations = i + 1;
+            }
+            break;
+        }
 
         generated.push_back(current_token);
         llama_sampler_accept(smpl, current_token);
 
+        if (with_timings) {
+            t_sample_ms += std::chrono::duration<double, std::milli>(clk::now() - t_s0).count();
+        }
+
+        auto t_d0 = with_timings ? clk::now() : clk::time_point{};
         batch = llama_batch_get_one(&current_token, 1);
         if (llama_decode(ctx, batch) != 0) {
             llama_sampler_free(smpl);
             Rf_error("llamaR: failed during token generation");
+        }
+        if (with_timings) {
+            t_decode_dispatch_ms += std::chrono::duration<double, std::milli>(clk::now() - t_d0).count();
+            // immediate post-dispatch drain: how much GPU work remains right
+            // after llama_decode returns? compare to t_gpu_sync_ms which is
+            // measured at the *start* of the next iteration (after batch_get_one etc.)
+            auto t_p0 = clk::now();
+            llama_synchronize(ctx);
+            t_post_decode_sync_ms += std::chrono::duration<double, std::milli>(clk::now() - t_p0).count();
+            if (i == 0) {
+                n_splits_decode = llama_n_splits(ctx);
+            }
+            n_iterations = i + 1;
         }
     }
 
@@ -481,8 +606,43 @@ extern "C" SEXP r_llama_generate(SEXP r_ctx, SEXP r_prompt,
 
     // --- detokenize generated tokens ---
     if (generated.empty()) {
-        return Rf_mkString("");
+        SEXP empty = PROTECT(Rf_mkString(""));
+        if (with_timings) {
+            double t_total_ms = std::chrono::duration<double, std::milli>(clk::now() - t_total_start).count();
+            const char * names[] = {
+                "t_tokenize_ms", "t_build_sampler_ms", "t_kv_clear_ms",
+                "t_prefill_dispatch_ms", "t_prefill_sync_ms",
+                "t_gpu_sync_ms", "t_sample_ms", "t_decode_dispatch_ms",
+                "t_post_decode_sync_ms", "t_detokenize_ms",
+                "n_iterations", "n_splits_prefill", "n_splits_decode",
+                "t_total_ms", NULL
+            };
+            SEXP timings = PROTECT(Rf_allocVector(REALSXP, 14));
+            REAL(timings)[0]  = t_tokenize_ms;
+            REAL(timings)[1]  = t_build_sampler_ms;
+            REAL(timings)[2]  = t_kv_clear_ms;
+            REAL(timings)[3]  = t_prefill_dispatch_ms;
+            REAL(timings)[4]  = t_prefill_sync_ms;
+            REAL(timings)[5]  = t_gpu_sync_ms;
+            REAL(timings)[6]  = t_sample_ms;
+            REAL(timings)[7]  = t_decode_dispatch_ms;
+            REAL(timings)[8]  = t_post_decode_sync_ms;
+            REAL(timings)[9]  = 0.0;  // detokenize (empty path)
+            REAL(timings)[10] = (double) n_iterations;
+            REAL(timings)[11] = (double) n_splits_prefill;
+            REAL(timings)[12] = (double) n_splits_decode;
+            REAL(timings)[13] = t_total_ms;
+            SEXP nm = PROTECT(Rf_allocVector(STRSXP, 14));
+            for (int k = 0; k < 14; k++) SET_STRING_ELT(nm, k, Rf_mkChar(names[k]));
+            Rf_setAttrib(timings, R_NamesSymbol, nm);
+            Rf_setAttrib(empty, Rf_install("timings"), timings);
+            UNPROTECT(2);
+        }
+        UNPROTECT(1);
+        return empty;
     }
+
+    if (with_timings) tic = clk::now();
 
     int text_len = llama_detokenize(vocab, generated.data(), (int) generated.size(),
                                     NULL, 0, false, false);
@@ -494,7 +654,549 @@ extern "C" SEXP r_llama_generate(SEXP r_ctx, SEXP r_prompt,
     if (result < 0) result = 0;
     text[result] = '\0';
 
-    return Rf_mkString(text.data());
+    if (with_timings) {
+        t_detokenize_ms = std::chrono::duration<double, std::milli>(clk::now() - tic).count();
+    }
+
+    SEXP r_text = PROTECT(Rf_mkString(text.data()));
+    if (with_timings) {
+        double t_total_ms = std::chrono::duration<double, std::milli>(clk::now() - t_total_start).count();
+        const char * names[] = {
+            "t_tokenize_ms", "t_build_sampler_ms", "t_kv_clear_ms",
+            "t_prefill_dispatch_ms", "t_prefill_sync_ms",
+            "t_gpu_sync_ms", "t_sample_ms", "t_decode_dispatch_ms",
+            "t_post_decode_sync_ms", "t_detokenize_ms",
+            "n_iterations", "n_splits_prefill", "n_splits_decode",
+            "t_total_ms", NULL
+        };
+        SEXP timings = PROTECT(Rf_allocVector(REALSXP, 14));
+        REAL(timings)[0]  = t_tokenize_ms;
+        REAL(timings)[1]  = t_build_sampler_ms;
+        REAL(timings)[2]  = t_kv_clear_ms;
+        REAL(timings)[3]  = t_prefill_dispatch_ms;
+        REAL(timings)[4]  = t_prefill_sync_ms;
+        REAL(timings)[5]  = t_gpu_sync_ms;
+        REAL(timings)[6]  = t_sample_ms;
+        REAL(timings)[7]  = t_decode_dispatch_ms;
+        REAL(timings)[8]  = t_post_decode_sync_ms;
+        REAL(timings)[9]  = t_detokenize_ms;
+        REAL(timings)[10] = (double) n_iterations;
+        REAL(timings)[11] = (double) n_splits_prefill;
+        REAL(timings)[12] = (double) n_splits_decode;
+        REAL(timings)[13] = t_total_ms;
+        SEXP nm = PROTECT(Rf_allocVector(STRSXP, 14));
+        for (int k = 0; k < 14; k++) SET_STRING_ELT(nm, k, Rf_mkChar(names[k]));
+        Rf_setAttrib(timings, R_NamesSymbol, nm);
+        Rf_setAttrib(r_text, Rf_install("timings"), timings);
+        UNPROTECT(2);
+    }
+    UNPROTECT(1);
+    return r_text;
+}
+
+// ============================================================
+// Streaming generation: begin / next / end (token-by-token)
+// ============================================================
+//
+// Splits r_llama_generate into three calls so callers can pull one chunk of
+// text at a time (e.g. to push into an SSE stream). State lives in an
+// externalptr with a GC finalizer that frees the sampler chain.
+
+// Length in bytes of the trailing run of bytes in `s` that forms an
+// incomplete (truncated) UTF-8 sequence. Returns 0 when `s` ends on a
+// complete character. Only the final, still-growing code point is held back.
+static size_t utf8_incomplete_tail(const std::string & s) {
+    size_t n = s.size();
+    // Scan back over continuation bytes (10xxxxxx) to find the last lead byte.
+    size_t i = n;
+    while (i > 0) {
+        unsigned char c = (unsigned char) s[i - 1];
+        if ((c & 0xC0) != 0x80) {  // not a continuation byte: this is the lead
+            i--;
+            break;
+        }
+        i--;
+    }
+    if (i >= n) return 0;  // last byte was itself a lead with no body, handled below
+    unsigned char lead = (unsigned char) s[i];
+    size_t need;
+    if      ((lead & 0x80) == 0x00) need = 1;  // 0xxxxxxx
+    else if ((lead & 0xE0) == 0xC0) need = 2;  // 110xxxxx
+    else if ((lead & 0xF0) == 0xE0) need = 3;  // 1110xxxx
+    else if ((lead & 0xF8) == 0xF0) need = 4;  // 11110xxx
+    else return 0;                             // stray continuation byte: emit as-is
+    size_t have = n - i;
+    return have < need ? have : 0;  // hold back only if the char is unfinished
+}
+
+extern "C" SEXP r_llama_gen_begin(SEXP r_ctx, SEXP r_prompt,
+                                  SEXP r_max_new_tokens, SEXP r_temp,
+                                  SEXP r_top_k, SEXP r_top_p, SEXP r_seed,
+                                  SEXP r_min_p, SEXP r_typical_p,
+                                  SEXP r_repeat_penalty, SEXP r_repeat_last_n,
+                                  SEXP r_frequency_penalty, SEXP r_presence_penalty,
+                                  SEXP r_mirostat, SEXP r_mirostat_tau,
+                                  SEXP r_mirostat_eta, SEXP r_grammar) {
+    llama_context * ctx = (llama_context *) R_ExternalPtrAddr(r_ctx);
+    if (!ctx) Rf_error("llamaR: invalid context pointer");
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    const char * prompt         = CHAR(STRING_ELT(r_prompt, 0));
+    int          max_new_tokens = INTEGER(r_max_new_tokens)[0];
+    float        temp           = (float) REAL(r_temp)[0];
+    int          top_k          = INTEGER(r_top_k)[0];
+    float        top_p          = (float) REAL(r_top_p)[0];
+    uint32_t     seed           = (uint32_t) INTEGER(r_seed)[0];
+    float        min_p          = (float) REAL(r_min_p)[0];
+    float        typical_p      = (float) REAL(r_typical_p)[0];
+    float        repeat_penalty = (float) REAL(r_repeat_penalty)[0];
+    int          repeat_last_n  = INTEGER(r_repeat_last_n)[0];
+    float        freq_penalty   = (float) REAL(r_frequency_penalty)[0];
+    float        pres_penalty   = (float) REAL(r_presence_penalty)[0];
+    int          mirostat       = INTEGER(r_mirostat)[0];
+    float        mirostat_tau   = (float) REAL(r_mirostat_tau)[0];
+    float        mirostat_eta   = (float) REAL(r_mirostat_eta)[0];
+    const char * grammar        = Rf_isNull(r_grammar) ? NULL : CHAR(STRING_ELT(r_grammar, 0));
+
+    int prompt_len = (int) strlen(prompt);
+
+    // --- tokenize prompt ---
+    // parse_special = true: prompt has been through the chat template, so its
+    // role markers are control tokens (see r_llama_generate for rationale).
+    int n_tokens = llama_tokenize(vocab, prompt, prompt_len, NULL, 0, true, true);
+    if (n_tokens < 0) n_tokens = -n_tokens;
+    if (n_tokens == 0) Rf_error("llamaR: prompt produced zero tokens");
+
+    std::vector<llama_token> prompt_tokens(n_tokens);
+    int actual = llama_tokenize(vocab, prompt, prompt_len,
+                                prompt_tokens.data(), n_tokens, true, true);
+    if (actual < 0) Rf_error("llamaR: tokenization failed");
+    n_tokens = actual;
+
+    // --- build sampler chain (identical to r_llama_generate) ---
+    auto sparams = llama_sampler_chain_default_params();
+    llama_sampler * smpl = llama_sampler_chain_init(sparams);
+
+    if (grammar && strlen(grammar) > 0) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_grammar(vocab, grammar, "root"));
+    }
+    if (repeat_penalty != 1.0f || freq_penalty != 0.0f || pres_penalty != 0.0f) {
+        llama_sampler_chain_add(smpl,
+            llama_sampler_init_penalties(repeat_last_n, repeat_penalty, freq_penalty, pres_penalty));
+    }
+    if (mirostat == 0) {
+        if (top_k > 0)     llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+        if (min_p > 0.0f)  llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p, 1));
+        if (typical_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_typical(typical_p, 1));
+        if (top_p < 1.0f)  llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
+        if (temp > 0.0f)   llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
+        if (temp > 0.0f)   llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed));
+        else               llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    } else if (mirostat == 1) {
+        int n_vocab_size = llama_vocab_n_tokens(vocab);
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp > 0.0f ? temp : 0.8f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_mirostat(n_vocab_size, seed, mirostat_tau, mirostat_eta, 100));
+    } else if (mirostat == 2) {
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp > 0.0f ? temp : 0.8f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_mirostat_v2(seed, mirostat_tau, mirostat_eta));
+    }
+
+    // --- clear KV cache and prefill the prompt ---
+    // Split the prefill into chunks of at most n_batch tokens: a single
+    // llama_decode call may carry no more than n_batch tokens (llama.cpp
+    // asserts otherwise). Positions continue automatically across calls
+    // since the KV cache was just cleared and grows with each decode.
+    llama_memory_clear(llama_get_memory(ctx), true);
+    int n_batch = (int) llama_n_batch(ctx);
+    if (n_batch <= 0) n_batch = n_tokens;
+    for (int off = 0; off < n_tokens; off += n_batch) {
+        int n_chunk = (n_tokens - off < n_batch) ? (n_tokens - off) : n_batch;
+        struct llama_batch batch = llama_batch_get_one(prompt_tokens.data() + off, n_chunk);
+        if (llama_decode(ctx, batch) != 0) {
+            llama_sampler_free(smpl);
+            Rf_error("llamaR: failed to process prompt (chunk at offset %d of %d)",
+                     off, n_tokens);
+        }
+    }
+
+    llama_gen_state * st = new llama_gen_state();
+    st->ctx         = ctx;
+    st->vocab       = vocab;
+    st->smpl        = smpl;
+    st->n_remaining = max_new_tokens;
+    st->done        = false;
+
+    SEXP ptr = PROTECT(R_MakeExternalPtr(st, Rf_install("llama_gen_state"), R_NilValue));
+    R_RegisterCFinalizerEx(ptr, gen_state_finalizer, TRUE);
+    UNPROTECT(1);
+    return ptr;
+}
+
+// One generation step. Returns a length-1 character vector with the next
+// chunk of text (possibly ""), or NULL when generation is finished (EOG
+// reached or token budget exhausted). Holds back an incomplete trailing
+// UTF-8 char until the next call; r_llama_gen_end() flushes any remainder.
+extern "C" SEXP r_llama_gen_next(SEXP r_state) {
+    llama_gen_state * st = (llama_gen_state *) R_ExternalPtrAddr(r_state);
+    if (!st) Rf_error("llamaR: invalid generation state pointer");
+    if (st->done || st->n_remaining <= 0) {
+        st->done = true;
+        return R_NilValue;
+    }
+
+    llama_token tok = llama_sampler_sample(st->smpl, st->ctx, -1);
+    if (llama_vocab_is_eog(st->vocab, tok)) {
+        st->done = true;
+        return R_NilValue;
+    }
+
+    llama_sampler_accept(st->smpl, tok);
+    st->n_remaining--;
+
+    // detokenize this single token, appending to the UTF-8 carry buffer
+    char piece[256];
+    int np = llama_token_to_piece(st->vocab, tok, piece, sizeof(piece), 0, false);
+    if (np < 0) {
+        std::vector<char> big(-np);
+        np = llama_token_to_piece(st->vocab, tok, big.data(), (int) big.size(), 0, false);
+        if (np > 0) st->utf8_buf.append(big.data(), np);
+    } else if (np > 0) {
+        st->utf8_buf.append(piece, np);
+    }
+
+    // decode the accepted token to advance the context for the next step
+    struct llama_batch batch = llama_batch_get_one(&tok, 1);
+    if (llama_decode(st->ctx, batch) != 0) {
+        st->done = true;
+        Rf_error("llamaR: failed during token generation");
+    }
+
+    // emit everything except a possibly-incomplete trailing UTF-8 char
+    size_t tail = utf8_incomplete_tail(st->utf8_buf);
+    size_t emit = st->utf8_buf.size() - tail;
+    SEXP r_text = PROTECT(Rf_ScalarString(
+        Rf_mkCharLenCE(st->utf8_buf.data(), (int) emit, CE_UTF8)));
+    st->utf8_buf.erase(0, emit);
+    UNPROTECT(1);
+    return r_text;
+}
+
+// Flush any bytes still held in the carry buffer and mark the state done.
+// Safe to call multiple times. The sampler is freed by the GC finalizer.
+extern "C" SEXP r_llama_gen_end(SEXP r_state) {
+    llama_gen_state * st = (llama_gen_state *) R_ExternalPtrAddr(r_state);
+    if (!st) Rf_error("llamaR: invalid generation state pointer");
+    st->done = true;
+    SEXP r_text = PROTECT(Rf_ScalarString(
+        Rf_mkCharLenCE(st->utf8_buf.data(), (int) st->utf8_buf.size(), CE_UTF8)));
+    st->utf8_buf.clear();
+    UNPROTECT(1);
+    return r_text;
+}
+
+// ============================================================
+// Generate batch: continuous batching for N independent prompts
+// ============================================================
+
+// Forward declaration; tokenize_text is defined later in the Embeddings section.
+static int tokenize_text(const llama_vocab * vocab, const char * text,
+                         std::vector<llama_token> & out);
+
+extern "C" SEXP r_llama_generate_batch(SEXP r_ctx, SEXP r_prompts,
+                                       SEXP r_max_new_tokens, SEXP r_temp,
+                                       SEXP r_top_k, SEXP r_top_p, SEXP r_seed,
+                                       SEXP r_min_p, SEXP r_typical_p,
+                                       SEXP r_repeat_penalty, SEXP r_repeat_last_n,
+                                       SEXP r_frequency_penalty, SEXP r_presence_penalty,
+                                       SEXP r_grammar) {
+    llama_context * ctx = (llama_context *) R_ExternalPtrAddr(r_ctx);
+    if (!ctx) Rf_error("llamaR: invalid context pointer");
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    int n_seq = Rf_length(r_prompts);
+    if (n_seq <= 0) Rf_error("llamaR: prompts must be non-empty character vector");
+
+    int max_new_tokens = INTEGER(r_max_new_tokens)[0];
+    float    temp           = (float) REAL(r_temp)[0];
+    int      top_k          = INTEGER(r_top_k)[0];
+    float    top_p          = (float) REAL(r_top_p)[0];
+    uint32_t seed           = (uint32_t) INTEGER(r_seed)[0];
+    float    min_p          = (float) REAL(r_min_p)[0];
+    float    typical_p      = (float) REAL(r_typical_p)[0];
+    float    repeat_penalty = (float) REAL(r_repeat_penalty)[0];
+    int      repeat_last_n  = INTEGER(r_repeat_last_n)[0];
+    float    freq_penalty   = (float) REAL(r_frequency_penalty)[0];
+    float    pres_penalty   = (float) REAL(r_presence_penalty)[0];
+    const char * grammar    = Rf_isNull(r_grammar) ? NULL : CHAR(STRING_ELT(r_grammar, 0));
+
+    // Capacity check: all prompts + max_new_tokens for all seqs must fit in n_ctx
+    {
+        uint32_t n_ctx = llama_n_ctx(ctx);
+        uint32_t n_seq_max = llama_n_seq_max(ctx);
+        if ((uint32_t) n_seq > n_seq_max) {
+            Rf_error("llamaR: %d prompts exceeds context n_seq_max=%u "
+                     "(rebuild context with larger n_seq_max)", n_seq, n_seq_max);
+        }
+        // Capacity check itself happens after tokenization below.
+        (void) n_ctx;
+    }
+
+    int64_t t_batch_build = 0, t_decode = 0, t_sample = 0;
+    int64_t t_prefill = 0, t_tokenize = 0, t_detokenize = 0;
+    int64_t t_gpu_sync = 0;
+
+    // --- tokenize all prompts ---
+    int64_t t0_tok = llama_time_us();
+    std::vector<std::vector<llama_token>> prompt_tokens(n_seq);
+    int total_prompt_tokens = 0;
+    for (int s = 0; s < n_seq; s++) {
+        const char * p = CHAR(STRING_ELT(r_prompts, s));
+        if (tokenize_text(vocab, p, prompt_tokens[s]) < 0) {
+            Rf_error("llamaR: tokenization failed for prompt %d", s + 1);
+        }
+        if (prompt_tokens[s].empty()) {
+            Rf_error("llamaR: prompt %d produced zero tokens", s + 1);
+        }
+        total_prompt_tokens += (int) prompt_tokens[s].size();
+    }
+    t_tokenize += llama_time_us() - t0_tok;
+
+    {
+        uint32_t n_ctx = llama_n_ctx(ctx);
+        uint32_t need  = (uint32_t) total_prompt_tokens + (uint32_t) (n_seq * max_new_tokens);
+        if (need > n_ctx) {
+            Rf_error("llamaR: required tokens (%u) exceed context n_ctx=%u "
+                     "(prompts=%d, max_new=%d)", need, n_ctx, total_prompt_tokens, max_new_tokens);
+        }
+    }
+
+    // --- build per-seq sampler chains (seed = base_seed + seq_id) ---
+    auto build_sampler = [&](uint32_t s_seed) -> llama_sampler * {
+        auto sparams = llama_sampler_chain_default_params();
+        llama_sampler * smpl = llama_sampler_chain_init(sparams);
+        if (grammar && strlen(grammar) > 0) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_grammar(vocab, grammar, "root"));
+        }
+        if (repeat_penalty != 1.0f || freq_penalty != 0.0f || pres_penalty != 0.0f) {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_penalties(repeat_last_n, repeat_penalty, freq_penalty, pres_penalty));
+        }
+        if (top_k > 0)
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+        if (min_p > 0.0f)
+            llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p, 1));
+        if (typical_p < 1.0f)
+            llama_sampler_chain_add(smpl, llama_sampler_init_typical(typical_p, 1));
+        if (top_p < 1.0f)
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
+        if (temp > 0.0f)
+            llama_sampler_chain_add(smpl, llama_sampler_init_temp(temp));
+        if (temp > 0.0f)
+            llama_sampler_chain_add(smpl, llama_sampler_init_dist(s_seed));
+        else
+            llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+        return smpl;
+    };
+
+    std::vector<llama_sampler *> smpls(n_seq, nullptr);
+    for (int s = 0; s < n_seq; s++) {
+        smpls[s] = build_sampler(seed + (uint32_t) s);
+    }
+
+    auto cleanup_samplers = [&]() {
+        for (int s = 0; s < n_seq; s++) {
+            if (smpls[s]) { llama_sampler_free(smpls[s]); smpls[s] = nullptr; }
+        }
+    };
+
+    // --- prefill: pack all prompts into one batch with distinct seq_ids ---
+    llama_memory_clear(llama_get_memory(ctx), true);
+
+    struct llama_batch batch = llama_batch_init(total_prompt_tokens, 0, n_seq);
+    std::vector<int> last_logits_idx(n_seq, -1);  // position in batch of last prompt token per seq
+    std::vector<int> seq_pos(n_seq, 0);            // next position to write for each seq
+    {
+        int pos = 0;
+        for (int s = 0; s < n_seq; s++) {
+            int n_p = (int) prompt_tokens[s].size();
+            for (int t = 0; t < n_p; t++) {
+                batch.token[pos]     = prompt_tokens[s][t];
+                batch.pos[pos]       = (llama_pos) t;
+                batch.n_seq_id[pos]  = 1;
+                batch.seq_id[pos][0] = (llama_seq_id) s;
+                batch.logits[pos]    = (t == n_p - 1) ? 1 : 0;
+                pos++;
+            }
+            last_logits_idx[s] = pos - 1;
+            seq_pos[s]         = n_p;
+        }
+        batch.n_tokens = total_prompt_tokens;
+    }
+
+    int64_t t0_prefill = llama_time_us();
+    if (llama_decode(ctx, batch) != 0) {
+        llama_batch_free(batch);
+        cleanup_samplers();
+        Rf_error("llamaR: prefill decode failed");
+    }
+    t_prefill += llama_time_us() - t0_prefill;
+    llama_batch_free(batch);
+
+    // --- per-seq state ---
+    std::vector<bool>                       active(n_seq, true);
+    std::vector<int>                        n_generated(n_seq, 0);
+    std::vector<std::vector<llama_token>>   generated(n_seq);
+    std::vector<int>                        finished(n_seq, 0);  // 0=running, 1=eos, 2=max_tokens
+
+    // Sample first token per seq from prefill logits
+    llama_memory_t mem = llama_get_memory(ctx);
+    int n_active = n_seq;
+    for (int s = 0; s < n_seq; s++) {
+        llama_token tok = llama_sampler_sample(smpls[s], ctx, last_logits_idx[s]);
+        if (llama_vocab_is_eog(vocab, tok) || max_new_tokens <= 0) {
+            active[s]   = false;
+            finished[s] = (max_new_tokens <= 0) ? 2 : 1;
+            n_active--;
+            llama_memory_seq_rm(mem, (llama_seq_id) s, -1, -1);
+            continue;
+        }
+        generated[s].push_back(tok);
+        llama_sampler_accept(smpls[s], tok);
+        n_generated[s] = 1;
+    }
+
+    // --- decode loop: one token per active seq per iteration ---
+    struct llama_batch dbatch = llama_batch_init(n_seq, 0, n_seq);
+    int n_decode_steps = 0;
+    int n_splits_first_decode = -1;
+    while (n_active > 0) {
+        // Build batch from last-generated tokens of each active seq
+        int64_t t0_bb = llama_time_us();
+        int pos = 0;
+        std::vector<int> idx_in_batch(n_seq, -1);
+        for (int s = 0; s < n_seq; s++) {
+            if (!active[s]) continue;
+            llama_token tok = generated[s].back();
+            dbatch.token[pos]     = tok;
+            dbatch.pos[pos]       = (llama_pos) seq_pos[s];
+            dbatch.n_seq_id[pos]  = 1;
+            dbatch.seq_id[pos][0] = (llama_seq_id) s;
+            dbatch.logits[pos]    = 1;
+            idx_in_batch[s]       = pos;
+            seq_pos[s]++;
+            pos++;
+        }
+        dbatch.n_tokens = pos;
+        t_batch_build += llama_time_us() - t0_bb;
+
+        int64_t t0_dec = llama_time_us();
+        if (llama_decode(ctx, dbatch) != 0) {
+            llama_batch_free(dbatch);
+            cleanup_samplers();
+            Rf_error("llamaR: decode failed during batch generation");
+        }
+        t_decode += llama_time_us() - t0_dec;
+        if (n_splits_first_decode < 0) {
+            n_splits_first_decode = llama_n_splits(ctx);
+        }
+
+        // Explicit GPU sync — separates "wait for GPU" from "CPU sample work"
+        int64_t t0_sync = llama_time_us();
+        llama_synchronize(ctx);
+        t_gpu_sync += llama_time_us() - t0_sync;
+
+        // Sample one token per active seq
+        int64_t t0_smp = llama_time_us();
+        for (int s = 0; s < n_seq; s++) {
+            if (!active[s]) continue;
+            llama_token tok = llama_sampler_sample(smpls[s], ctx, idx_in_batch[s]);
+
+            if (llama_vocab_is_eog(vocab, tok)) {
+                active[s]   = false;
+                finished[s] = 1;
+                n_active--;
+                llama_memory_seq_rm(mem, (llama_seq_id) s, -1, -1);
+                continue;
+            }
+
+            generated[s].push_back(tok);
+            llama_sampler_accept(smpls[s], tok);
+            n_generated[s]++;
+
+            if (n_generated[s] >= max_new_tokens) {
+                active[s]   = false;
+                finished[s] = 2;
+                n_active--;
+                llama_memory_seq_rm(mem, (llama_seq_id) s, -1, -1);
+            }
+        }
+        t_sample += llama_time_us() - t0_smp;
+        n_decode_steps++;
+    }
+    llama_batch_free(dbatch);
+    cleanup_samplers();
+
+    // --- detokenize per seq, build result list ---
+    int64_t t0_detok = llama_time_us();
+    SEXP result = PROTECT(Rf_allocVector(VECSXP, n_seq));
+    for (int s = 0; s < n_seq; s++) {
+        SEXP item = PROTECT(Rf_allocVector(VECSXP, 3));
+
+        // text
+        SEXP r_text;
+        if (generated[s].empty()) {
+            r_text = PROTECT(Rf_mkString(""));
+        } else {
+            int text_len = llama_detokenize(vocab, generated[s].data(), (int) generated[s].size(),
+                                            NULL, 0, false, false);
+            if (text_len < 0) text_len = -text_len;
+            std::vector<char> buf(text_len + 1);
+            int written = llama_detokenize(vocab, generated[s].data(), (int) generated[s].size(),
+                                           buf.data(), text_len, false, false);
+            if (written < 0) written = 0;
+            buf[written] = '\0';
+            r_text = PROTECT(Rf_mkString(buf.data()));
+        }
+        SET_VECTOR_ELT(item, 0, r_text);
+        UNPROTECT(1);
+
+        SET_VECTOR_ELT(item, 1, Rf_ScalarInteger(n_generated[s]));
+
+        const char * reason = (finished[s] == 1) ? "eos"
+                            : (finished[s] == 2) ? "max_tokens"
+                            : "running";
+        SET_VECTOR_ELT(item, 2, Rf_mkString(reason));
+
+        SEXP item_names = PROTECT(Rf_allocVector(STRSXP, 3));
+        SET_STRING_ELT(item_names, 0, Rf_mkChar("text"));
+        SET_STRING_ELT(item_names, 1, Rf_mkChar("n_tokens"));
+        SET_STRING_ELT(item_names, 2, Rf_mkChar("finished_reason"));
+        Rf_setAttrib(item, R_NamesSymbol, item_names);
+        UNPROTECT(1);
+
+        SET_VECTOR_ELT(result, s, item);
+        UNPROTECT(1);
+    }
+    t_detokenize += llama_time_us() - t0_detok;
+
+    int64_t t_accounted = t_tokenize + t_prefill + t_batch_build + t_decode + t_gpu_sync + t_sample + t_detokenize;
+    REprintf("=== Decode loop timing ===\n");
+    REprintf("  t_tokenize:    %.1f ms\n", t_tokenize    / 1000.0);
+    REprintf("  t_prefill:     %.1f ms\n", t_prefill     / 1000.0);
+    REprintf("  t_batch_build: %.1f ms (%d steps)\n", t_batch_build / 1000.0, n_decode_steps);
+    REprintf("  t_decode:      %.1f ms (%d steps, dispatch only)\n", t_decode    / 1000.0, n_decode_steps);
+    REprintf("  t_gpu_sync:    %.1f ms (%d steps, GPU wait)\n",      t_gpu_sync  / 1000.0, n_decode_steps);
+    REprintf("  t_sample:      %.1f ms (%d steps, pure CPU)\n",      t_sample    / 1000.0, n_decode_steps);
+    REprintf("  t_detokenize:  %.1f ms\n", t_detokenize  / 1000.0);
+    REprintf("  ACCOUNTED:     %.1f ms\n", t_accounted   / 1000.0);
+    REprintf("  n_splits (1st decode call): %d\n", n_splits_first_decode);
+
+    UNPROTECT(1);
+    return result;
 }
 
 // ============================================================
@@ -541,13 +1243,18 @@ extern "C" SEXP r_llama_embeddings(SEXP r_ctx, SEXP r_text) {
     }
 
     int n_embd = llama_model_n_embd(model);
+
+    // Copy out of the context's embedding buffer, then reset the flag, before
+    // building the R result — keeps r_result from being live across the
+    // llama_set_embeddings call (which rchk flags as allocating).
+    std::vector<float> emb_copy(emb, emb + n_embd);
+    llama_set_embeddings(ctx, false);
+
     SEXP r_result = PROTECT(Rf_allocVector(REALSXP, n_embd));
     for (int i = 0; i < n_embd; i++) {
-        REAL(r_result)[i] = (double) emb[i];
+        REAL(r_result)[i] = (double) emb_copy[i];
     }
     UNPROTECT(1);
-
-    llama_set_embeddings(ctx, false);
     return r_result;
 }
 
@@ -749,19 +1456,28 @@ extern "C" SEXP r_llama_chat_apply_template(SEXP r_tmpl, SEXP r_messages, SEXP r
     std::vector<std::string> roles(n_msg);
     std::vector<std::string> contents(n_msg);
 
+    // Cache the symbols so Rf_install (an allocating call) runs once up front,
+    // not inside the loop where r_role/r_content would be live across it.
+    SEXP sym_role = Rf_install("role");
+    SEXP sym_content = Rf_install("content");
+
     for (int i = 0; i < n_msg; i++) {
         SEXP msg = VECTOR_ELT(r_messages, i);
-        SEXP r_role = Rf_getAttrib(msg, Rf_install("role"));
-        SEXP r_content = Rf_getAttrib(msg, Rf_install("content"));
 
-        // Try list element access if attributes don't work
-        if (Rf_isNull(r_role)) {
-            r_role = VECTOR_ELT(msg, 0);
-            r_content = VECTOR_ELT(msg, 1);
+        // Resolve role and content independently and extract each string
+        // immediately, so no SEXP is held live across another allocating call
+        // (PROTECT-wise rchk-clean). r_role/r_content are scoped per branch.
+        {
+            SEXP r_role = Rf_getAttrib(msg, sym_role);
+            if (Rf_isNull(r_role)) r_role = VECTOR_ELT(msg, 0);
+            roles[i] = CHAR(STRING_ELT(r_role, 0));
+        }
+        {
+            SEXP r_content = Rf_getAttrib(msg, sym_content);
+            if (Rf_isNull(r_content)) r_content = VECTOR_ELT(msg, 1);
+            contents[i] = CHAR(STRING_ELT(r_content, 0));
         }
 
-        roles[i] = CHAR(STRING_ELT(r_role, 0));
-        contents[i] = CHAR(STRING_ELT(r_content, 0));
         messages[i].role = roles[i].c_str();
         messages[i].content = contents[i].c_str();
     }
@@ -1076,12 +1792,22 @@ extern "C" SEXP r_llama_set_abort_callback(SEXP r_ctx, SEXP r_fn) {
     llama_context * ctx = (llama_context *) R_ExternalPtrAddr(r_ctx);
     if (!ctx) Rf_error("llamaR: invalid context pointer");
 
-    if (r_fn == R_NilValue) {
-        // Clear callback
+    // Validate before mutating any state, so an error leaves the old callback
+    // intact rather than half-replaced.
+    if (r_fn != R_NilValue && !Rf_isFunction(r_fn)) {
+        Rf_error("llamaR: abort_callback must be a function or NULL");
+    }
+
+    // Release the previously preserved callback (if any) before replacing it,
+    // otherwise it leaks on the precious list and stays alive forever.
+    if (s_abort_callback != R_NilValue) {
+        R_ReleaseObject(s_abort_callback);
         s_abort_callback = R_NilValue;
+    }
+
+    if (r_fn == R_NilValue) {
         llama_set_abort_callback(ctx, NULL, NULL);
     } else {
-        if (!Rf_isFunction(r_fn)) Rf_error("llamaR: abort_callback must be a function or NULL");
         s_abort_callback = r_fn;
         R_PreserveObject(s_abort_callback);
         llama_set_abort_callback(ctx, r_abort_callback, NULL);
@@ -1429,7 +2155,8 @@ extern "C" SEXP r_llama_batch_init(SEXP r_n_tokens, SEXP r_embd, SEXP r_n_seq_ma
     struct llama_batch * batch = new llama_batch;
     *batch = llama_batch_init(n_tokens, embd, n_seq_max);
 
-    SEXP result = PROTECT(R_MakeExternalPtr(batch, Rf_mkString("llama_batch"), R_NilValue));
+    SEXP tag = PROTECT(Rf_mkString("llama_batch"));
+    SEXP result = PROTECT(R_MakeExternalPtr(batch, tag, R_NilValue));
     R_RegisterCFinalizer(result, [](SEXP x) {
         llama_batch * b = (llama_batch *) R_ExternalPtrAddr(x);
         if (b) {
@@ -1438,7 +2165,7 @@ extern "C" SEXP r_llama_batch_init(SEXP r_n_tokens, SEXP r_embd, SEXP r_n_seq_ma
             R_SetExternalPtrAddr(x, NULL);
         }
     });
-    UNPROTECT(1);
+    UNPROTECT(2);
     return result;
 }
 
@@ -1512,7 +2239,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"r_llama_time_us",               (DL_FUNC) &r_llama_time_us,               0},
     {"r_llama_numa_init",             (DL_FUNC) &r_llama_numa_init,             1},
     {"r_llama_backend_devices",       (DL_FUNC) &r_llama_backend_devices,       0},
-    {"r_llama_load_model",            (DL_FUNC) &r_llama_load_model,            3},
+    {"r_llama_load_model",            (DL_FUNC) &r_llama_load_model,            6},
     {"r_llama_free_model",            (DL_FUNC) &r_llama_free_model,            1},
     {"r_llama_model_info",            (DL_FUNC) &r_llama_model_info,            1},
     {"r_llama_model_size",            (DL_FUNC) &r_llama_model_size,            1},
@@ -1530,7 +2257,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"r_llama_vocab_get_text",        (DL_FUNC) &r_llama_vocab_get_text,        2},
     {"r_llama_vocab_get_score",       (DL_FUNC) &r_llama_vocab_get_score,       2},
     // Context
-    {"r_llama_new_context",           (DL_FUNC) &r_llama_new_context,           4},
+    {"r_llama_new_context",           (DL_FUNC) &r_llama_new_context,           9},
     {"r_llama_free_context",          (DL_FUNC) &r_llama_free_context,          1},
     {"r_llama_get_model",             (DL_FUNC) &r_llama_get_model,             1},
     {"r_llama_set_warmup",            (DL_FUNC) &r_llama_set_warmup,            2},
@@ -1546,7 +2273,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"r_llama_set_n_threads",         (DL_FUNC) &r_llama_set_n_threads,         3},
     {"r_llama_set_causal_attn",       (DL_FUNC) &r_llama_set_causal_attn,       2},
     // Tokenize / Detokenize / Token piece
-    {"r_llama_tokenize",              (DL_FUNC) &r_llama_tokenize,              3},
+    {"r_llama_tokenize",              (DL_FUNC) &r_llama_tokenize,              4},
     {"r_llama_detokenize",            (DL_FUNC) &r_llama_detokenize,            2},
     {"r_llama_token_to_piece",        (DL_FUNC) &r_llama_token_to_piece,        3},
     // Batch
@@ -1555,7 +2282,11 @@ static const R_CallMethodDef CallEntries[] = {
     // Encode
     {"r_llama_encode",                (DL_FUNC) &r_llama_encode,                2},
     // Generate
-    {"r_llama_generate",              (DL_FUNC) &r_llama_generate,              17},
+    {"r_llama_generate",              (DL_FUNC) &r_llama_generate,              18},
+    {"r_llama_gen_begin",             (DL_FUNC) &r_llama_gen_begin,             17},
+    {"r_llama_gen_next",              (DL_FUNC) &r_llama_gen_next,              1},
+    {"r_llama_gen_end",               (DL_FUNC) &r_llama_gen_end,               1},
+    {"r_llama_generate_batch",        (DL_FUNC) &r_llama_generate_batch,        14},
     // Embeddings & Logits
     {"r_llama_embeddings",            (DL_FUNC) &r_llama_embeddings,            2},
     {"r_llama_embed_batch",           (DL_FUNC) &r_llama_embed_batch,           2},
